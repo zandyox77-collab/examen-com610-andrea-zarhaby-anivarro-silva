@@ -1,0 +1,102 @@
+name: CD
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set lowercase image name
+        run: echo "IMAGE_NAME=ghcr.io/${{ github.repository_owner }}/catalogo-libros-api" >> $GITHUB_ENV
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image with commit SHA
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:latest
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set lowercase image name
+        run: echo "IMAGE_NAME=ghcr.io/${{ github.repository_owner }}/catalogo-libros-api" >> $GITHUB_ENV
+
+      - name: Deploy to EC2 and verify health/libros
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+            IMAGE_TAG="${{ env.IMAGE_NAME }}:${{ github.sha }}"
+            ENV_FILE="/home/ubuntu/examen-com610-andrea-zarhaby-anivarro-silva/.env"
+            CONTAINER_NAME="catalogo-libros-api"
+            PREV_IMAGE=$(docker inspect --format='{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || true)
+
+            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+            docker pull "$IMAGE_TAG"
+
+            pkill -f "node src/server.js" || true
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+
+            docker run -d \
+              --name "$CONTAINER_NAME" \
+              --restart unless-stopped \
+              --env-file "$ENV_FILE" \
+              -p 127.0.0.1:3000:3000 \
+              "$IMAGE_TAG"
+
+            sleep 3
+            if ! curl -fsS http://127.0.0.1:3000/health > /dev/null || ! curl -fsS http://127.0.0.1:3000/libros > /dev/null; then
+              echo "Verificacion fallida; restaurando version anterior..."
+              docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+              if [ -n "$PREV_IMAGE" ]; then
+                docker run -d \
+                  --name "$CONTAINER_NAME" \
+                  --restart unless-stopped \
+                  --env-file "$ENV_FILE" \
+                  -p 127.0.0.1:3000:3000 \
+                  "$PREV_IMAGE"
+              fi
+              exit 1
+            fi
